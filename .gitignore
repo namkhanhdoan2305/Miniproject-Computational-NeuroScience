@@ -1,0 +1,11 @@
+artifacts/
+temp_raw/
+*.npy
+*.fif
+*.pkl
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

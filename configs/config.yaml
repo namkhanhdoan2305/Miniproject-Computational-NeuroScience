@@ -1,0 +1,66 @@
+seed: 42
+paths:
+  artifacts: ./artifacts
+  # Dedicated, disposable directory; never point this at Drive or the project.
+  raw: /content/temp_raw
+dataset:
+  repo_id: duylplsn/oddball
+  revision: main  # Resolved to an immutable commit before downloading.
+  expected_subjects: 42
+  subjects: null  # null = discover every sub-XX directory, or [sub-01, sub-02, ...]
+events:
+  column: event_type
+  # Dzianok et al. (2022), Table 3; normalize whitespace/case only.
+  standard: [S5, standard]
+  target: [S6, target]
+  distractor: [S7, distractor, deviant]
+preprocessing:
+  l_freq: 0.5
+  h_freq: 30.0
+  notch_freq: 50.0
+  sfreq: 250.0
+  tmin: -0.2
+  tmax: 1.0
+  baseline: [-0.2, 0.0]
+  reference: average
+  # 30 scalp channels reduce CPU/RAM use; null keeps all EEG channels.
+  # Ear channels TP9/TP10 are intentionally absent from this scalp subset.
+  channels: [Fp1, Fz, F3, F7, FT9, FC5, FC1, C3, T7, CP5, CP1, Pz, P3, P7, O1, Oz, O2, P4, P8, CP6, CP2, Cz, C4, T8, FT10, FC6, FC2, F4, F8, Fp2]
+  reject_uv: 150.0  # Peak-to-peak threshold; null disables amplitude rejection.
+  flat_uv: 0.1
+  n_jobs: 1
+  ica:
+    enabled: true
+    n_components: 20
+    max_iter: 500
+    fit_highpass: 1.0
+    # Fit on up to 5 minutes, then apply to the entire recording.
+    fit_max_seconds: 300.0  # null = full recording
+    decim: 2
+    eog_channels: []  # Use real EOG channels automatically if available.
+    eog_proxy_channels: [Fp1, Fp2]
+    eog_threshold: 3.0
+features:
+  batch_size: 128
+  window: [0.0, 1.0]
+  p300_window: [0.3, 0.6]
+  bands:
+    delta: [0.5, 4.0]
+    theta: [4.0, 8.0]
+    alpha: [8.0, 13.0]
+    beta: [13.0, 30.0]
+  welch_seconds: 1.0
+  entropy_bins: 32
+  wavelet: db4
+  wavelet_level: 4
+training:
+  cv_folds: 5
+  n_jobs: 2
+  # Linear SVM scales to all subjects on CPU; no hyperparameter search on test folds.
+  svm_c: 1.0
+  rf_estimators: 300
+  rf_min_samples_leaf: 2
+  save_fold_models: true
+visualization:
+  channels: [Fz, Pz]
+  distribution_features: [p300_mean_uv, log10_power_theta, spectral_entropy, shannon_entropy]
