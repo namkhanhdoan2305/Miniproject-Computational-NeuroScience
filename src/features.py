@@ -12,6 +12,8 @@ from scipy.integrate import trapezoid
 from scipy.signal import welch
 from scipy.special import xlogy
 
+FEATURE_SCHEMA_VERSION = 2
+
 try:
     from .common import (DEFAULT_CONFIG, LOGGER, artifact_dir, fingerprint, load_config,
                          load_epochs, package_versions, read_json, setup_logging, write_json)
@@ -22,6 +24,8 @@ except ImportError:
 
 def normalized_entropy(weights):
     """Shannon entropy in [0, 1]; all-zero and single-bin distributions return 0."""
+    if weights.shape[-1] < 2:
+        return np.zeros(weights.shape[:-1], dtype=float)
     total = weights.sum(axis=-1, keepdims=True)
     probabilities = np.divide(weights, total, out=np.zeros_like(weights, dtype=float), where=total > 0)
     return -np.sum(xlogy(probabilities, probabilities), axis=-1) / np.log(weights.shape[-1])
@@ -101,9 +105,26 @@ def extract_batch(x, sfreq, times, channels, settings):
     add(response.max(axis=-1), "p300_peak_uv")  # Positive peak, not absolute magnitude.
     add(response.std(axis=-1), "p300_std_uv")
     add(times[p300][response.argmax(axis=-1)] * 1000, "p300_peak_latency_ms")
+    add(trapezoid(response, x=times[p300], axis=-1), "p300_auc_uv_s")
     # Channel-major order, then the same feature suffixes for every channel.
     values = np.stack(blocks, axis=-1).reshape(len(x), -1).astype(np.float32)
     names = [f"{channel}__{suffix}" for channel in channels for suffix in suffixes]
+    roi = settings.get("roi_channels", [])
+    if roi:
+        if len(set(roi)) != len(roi) or not set(roi).issubset(channels):
+            raise ValueError(f"P300 ROI channels must be unique and available: {roi}")
+        # Average channel waveforms before taking the peak/latency, rather than
+        # averaging unrelated individual-channel peaks.
+        indices = [list(channels).index(channel) for channel in roi]
+        roi_response = response[:, indices, :].mean(axis=1)
+        roi_values = np.column_stack([
+            roi_response.mean(axis=-1), roi_response.max(axis=-1),
+            roi_response.std(axis=-1), times[p300][roi_response.argmax(axis=-1)] * 1000,
+            trapezoid(roi_response, x=times[p300], axis=-1),
+        ])
+        roi_suffixes = ["p300_mean_uv", "p300_peak_uv", "p300_std_uv", "p300_peak_latency_ms", "p300_auc_uv_s"]
+        names.extend(f"Midline_{'_'.join(roi)}__{suffix}" for suffix in roi_suffixes)
+        values = np.column_stack([values, roi_values]).astype(np.float32)
     if not np.isfinite(values).all():
         raise ValueError("Feature extraction produced nonfinite values.")
     return values, names
@@ -113,7 +134,7 @@ def run(config):
     output = artifact_dir(config)
     x, _, _, channels, times, metadata = load_epochs(output)
     settings = config["features"]
-    source = {"dataset_id": metadata["dataset_id"], "features": settings,
+    source = {"dataset_id": metadata["dataset_id"], "extractor_version": FEATURE_SCHEMA_VERSION, "features": settings,
               "sfreq": metadata["sfreq"], "channels": channels.tolist()}
     signature = fingerprint(source)
     marker = output / "feature_metadata.json"
@@ -143,6 +164,8 @@ def load_features(directory):
     directory = Path(directory)
     _, y, groups, _, _, metadata = load_epochs(directory)
     info = read_json(directory / "feature_metadata.json")
+    if info["source"].get("extractor_version") != FEATURE_SCHEMA_VERSION:
+        raise ValueError("Feature schema changed; rerun src.features before training.")
     if info["source"]["dataset_id"] != metadata["dataset_id"]:
         raise ValueError("Features are stale after preprocessing; rerun src.features.")
     values = np.load(directory / "features.npy", mmap_mode="r", allow_pickle=False)

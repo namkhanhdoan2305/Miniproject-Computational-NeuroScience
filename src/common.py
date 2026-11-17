@@ -37,6 +37,12 @@ def load_config(path=DEFAULT_CONFIG):
             raise ValueError(f"features.{key} must lie inside the epoch.")
     if config["training"]["cv_folds"] < 2 or config["features"]["batch_size"] < 1:
         raise ValueError("Need at least two CV folds and a positive batch size.")
+    priors = config["training"]["lda_priors"]
+    if len(priors) != 2 or min(priors) <= 0 or not np.isclose(sum(priors), 1):
+        raise ValueError("lda_priors must contain two positive probabilities summing to one.")
+    ica = p["ica"]
+    if ica["enabled"] and not p["l_freq"] <= ica["fit_highpass"] < p["h_freq"]:
+        raise ValueError("ICA fit high-pass must lie within the preprocessing passband.")
     return config
 
 
@@ -86,8 +92,12 @@ def load_epochs(directory):
         raise ValueError("Epoch arrays have inconsistent shapes.")
     if x.shape[1:] != (len(channels), len(times)) or list(x.shape) != meta["shape"]:
         raise ValueError("Epoch schema does not match metadata.")
+    if len(set(channels)) != len(channels) or not np.isfinite(times).all() or meta["units"] != "V":
+        raise ValueError("Require unique channel names, finite times, and EEG in volts.")
     if set(np.unique(y)) != {0, 1} or set(np.unique(groups)) != set(meta["subjects"]):
         raise ValueError("Require binary labels and the recorded subject identities.")
     if not np.allclose(np.diff(times), 1 / meta["sfreq"], atol=1e-9):
         raise ValueError("Time grid and saved sampling frequency disagree.")
+    if any(set(np.unique(y[groups == subject])) != {0, 1} for subject in np.unique(groups)):
+        raise ValueError("Each subject must retain both classes for subject-level averaging.")
     return x, y, groups, channels, times, meta

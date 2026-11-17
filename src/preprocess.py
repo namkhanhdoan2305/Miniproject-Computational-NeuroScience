@@ -25,6 +25,8 @@ from huggingface_hub import HfApi, snapshot_download
 from sklearn.exceptions import ConvergenceWarning
 from threadpoolctl import threadpool_limits
 
+PREPROCESSING_VERSION = 2
+
 try:
     from .common import (DEFAULT_CONFIG, LOGGER, artifact_dir, fingerprint, load_config,
                          package_versions, read_json, setup_logging, write_json)
@@ -89,7 +91,15 @@ def prepare_channels(raw, header, config):
     rename = {name: {"TP9 LEFT EAR": "TP9", "TP10 RIGHT EAR": "TP10"}.get(name, name.strip())
               for name in raw.ch_names}
     raw.rename_channels(rename)
+    configured_eog = config["preprocessing"]["ica"]["eog_channels"]
+    if not set(configured_eog).issubset(raw.ch_names):
+        raise ValueError("Configured EOG reference is absent from the recording.")
+    # Explicit EOG overrides can fix sidecars that incorrectly label EOG as EEG.
     requested = config["preprocessing"]["channels"]
+    if requested is not None and set(configured_eog) & set(requested):
+        raise ValueError("An EOG reference cannot also be a requested EEG feature channel.")
+    if configured_eog:
+        raw.set_channel_types({channel: "eog" for channel in configured_eog}, verbose=False)
     eeg = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
     if requested is None:
         requested = eeg
@@ -115,7 +125,8 @@ def clean_with_ica(raw, config):
     fit_raw = raw.copy()
     if settings["fit_max_seconds"] is not None:
         fit_raw.crop(tmax=min(float(settings["fit_max_seconds"]), fit_raw.times[-1]))
-    fit_raw.filter(settings["fit_highpass"], None, picks=eeg, n_jobs=1, verbose=False)
+    fit_raw.filter(settings["fit_highpass"], None, picks=eeg, n_jobs=1,
+                   skip_by_annotation=("edge", "bad"), verbose=False)
     if raw.info["sfreq"] / settings["decim"] / 2 <= config["preprocessing"]["h_freq"]:
         raise ValueError("ICA decimation would alias the filtered signal; reduce ica.decim.")
     # MNE 1.13 introduced rng; retain compatibility with earlier Colab installs.
@@ -130,6 +141,9 @@ def clean_with_ica(raw, config):
     convergence = [str(item.message) for item in caught if issubclass(item.category, ConvergenceWarning)]
     for message in convergence:
         LOGGER.warning("ICA convergence: %s", message)
+    for item in caught:
+        if not issubclass(item.category, ConvergenceWarning):
+            warnings.warn(str(item.message), item.category, stacklevel=2)
     real_eog = [raw.ch_names[i] for i in mne.pick_types(raw.info, eog=True, exclude="bads")]
     configured = settings["eog_channels"]
     if configured and not set(configured).issubset(raw.ch_names):
@@ -149,6 +163,8 @@ def clean_with_ica(raw, config):
         excluded.update(indices)
         scores[channel] = np.asarray(values).tolist()
     ica.exclude = sorted(int(index) for index in excluded)
+    if not ica.exclude:
+        LOGGER.warning("ICA found no EOG components; inspect the saved correlation scores.")
     if len(ica.exclude) >= ica.n_components_:
         raise ValueError("ICA marked every component; inspect data and EOG configuration.")
     ica.apply(raw, verbose=False)
@@ -283,13 +299,13 @@ def consolidate(subjects, output, signature, revision, config, dry_run=False):
     (output / "metadata.json").unlink(missing_ok=True)
     names = ("X", "y", "groups")
     temporary = {name: output / f".{name}.tmp.npy" for name in names}
-    arrays = {
-        "X": np.lib.format.open_memmap(temporary["X"], mode="w+", dtype="float32", shape=shape),
-        "y": np.lib.format.open_memmap(temporary["y"], mode="w+", dtype="int8", shape=(total,)),
-        "groups": np.lib.format.open_memmap(temporary["groups"], mode="w+", dtype=f"U{max(map(len, subjects))}", shape=(total,)),
-    }
+    arrays = {}
     offset, class_counts = 0, np.zeros(2, dtype=int)
     try:
+        # Allocation itself can fail (e.g. Drive full). Keep it inside cleanup.
+        for name, dtype, array_shape in (("X", "float32", shape), ("y", "int8", (total,)),
+                                         ("groups", f"U{max(map(len, subjects))}", (total,))):
+            arrays[name] = np.lib.format.open_memmap(temporary[name], mode="w+", dtype=dtype, shape=array_shape)
         for subject, meta in zip(subjects, metadata):
             directory = shards / subject
             if not np.array_equal(channels, np.load(directory / "ch_names.npy", allow_pickle=False)) or not np.array_equal(times, np.load(directory / "times.npy", allow_pickle=False)):
@@ -312,6 +328,7 @@ def consolidate(subjects, output, signature, revision, config, dry_run=False):
         np.save(output / "times.npy", times, allow_pickle=False)
         write_json(output / "metadata.json", {
             "dataset_id": uuid.uuid4().hex, "preprocessing_signature": signature,
+            "preprocessing_version": PREPROCESSING_VERSION,
             "repo_id": config["dataset"]["repo_id"], "revision": revision,
             "subjects": subjects, "dry_run": dry_run, "shape": list(shape),
             "units": "V", "sfreq": float(config["preprocessing"]["sfreq"]),
@@ -337,7 +354,7 @@ def run(config, dry_run=False, resume=False, overwrite=False):
     subjects = ["sub-01"] if dry_run else (config["dataset"]["subjects"] or discovered)
     if not subjects or len(set(subjects)) != len(subjects) or not set(subjects).issubset(discovered):
         raise ValueError(f"Subjects must be unique and present in the repo. Available: {discovered}")
-    signature = fingerprint({"revision": revision, "repo": config["dataset"]["repo_id"],
+    signature = fingerprint({"pipeline_version": PREPROCESSING_VERSION, "revision": revision, "repo": config["dataset"]["repo_id"],
                              "events": config["events"], "preprocessing": config["preprocessing"], "seed": config["seed"]})
     if (output / "metadata.json").exists():
         previous = read_json(output / "metadata.json")

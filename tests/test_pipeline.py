@@ -15,6 +15,9 @@ from unittest.mock import patch
 import mne
 import numpy as np
 import pandas as pd
+from PIL import Image
+from scipy.stats import t as student_t
+from sklearn.metrics import average_precision_score, precision_score, recall_score, roc_auc_score
 from threadpoolctl import threadpool_limits
 
 from src import features, preprocess, train_ml, visualize
@@ -77,11 +80,11 @@ class PipelineTests(unittest.TestCase):
     def test_event_mapping_drops_distractors_and_responses(self):
         raw = mne.io.RawArray(np.zeros((1, 5000)), mne.create_info(["Pz"], 500, "eeg"), verbose=False)
         path = self.root / "events.tsv"
-        pd.DataFrame({"onset": [1, 2, 3, 4], "event_type": [" S  5 ", "s6", "S 7", "S 1"],
-                      "trial_type": ["stimulus", "stimulus", "stimulus", "response"]}).to_csv(path, sep="\t", index=False)
+        pd.DataFrame({"onset": [1, 2, 3, 4, 5], "event_type": [" S  5 ", "s6", "S 7", "S 1", "frequent"],
+                      "trial_type": ["stimulus", "stimulus", "stimulus", "response", "stimulus"]}).to_csv(path, sep="\t", index=False)
         events, counts = preprocess.read_events(path, raw, self.config)
-        np.testing.assert_array_equal(events[:, [0, 2]], [[500, 1], [1000, 2]])
-        self.assertEqual(counts, {"standard": 1, "target": 1, "distractor": 1})
+        np.testing.assert_array_equal(events[:, [0, 2]], [[500, 1], [1000, 2], [2500, 1]])
+        self.assertEqual(counts, {"standard": 2, "target": 1, "distractor": 1})
         table = pd.read_csv(path, sep="\t")
         table.loc[2, "event_type"] = "S 99"
         table.to_csv(path, sep="\t", index=False)
@@ -116,11 +119,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(report["ica"]["excluded"], [0])
         json.dumps(report, allow_nan=False)  # Nonempty exclusions must serialize too.
 
+    def test_explicit_eog_override_stays_out_of_eeg_features(self):
+        header = write_brainvision(self.root, "sub-01")
+        self.config["preprocessing"]["channels"] = None
+        self.config["preprocessing"]["ica"].update({"enabled": False, "eog_channels": ["Fp1"]})
+        x, _, channels, _, _ = preprocess.process_recording(header, self.config)
+        self.assertNotIn("Fp1", channels)
+        self.assertEqual(x.shape[1], len(CHANNELS) - 1)
+
     def test_recording_boundaries_are_not_accepted_as_continuous_epochs(self):
         header = write_brainvision(self.root, "sub-01")
         marker = header.with_suffix(".vmrk")
         with marker.open("a", encoding="utf-8") as handle:
-            handle.write("\nMk29=New Segment,,2651,0,0\n")  # 5.3 s, within the first target epoch.
+            handle.write("\nMk29=New Segment,,8651,0,0\n")  # 17.3 s, within a target epoch.
         self.config["preprocessing"]["ica"]["enabled"] = False
         x, y, _, _, report = preprocess.process_recording(header, self.config)
         self.assertEqual(len(x), 20)
@@ -144,8 +155,9 @@ class PipelineTests(unittest.TestCase):
         times = np.arange(-50, 251) / 250
         signal = np.sin(2 * np.pi * 6 * times) * 5e-6
         x = np.stack([signal, np.zeros_like(signal)])[:, None, :]
+        self.config["features"]["roi_channels"] = []
         values, names = features.extract_batch(x, 250, times, ["Pz"], self.config["features"])
-        self.assertEqual(values.shape, (2, 25))
+        self.assertEqual(values.shape, (2, 26))
         self.assertTrue(np.isfinite(values).all())
         self.assertGreater(values[0, names.index("Pz__log10_power_theta")],
                            values[0, names.index("Pz__log10_power_alpha")] + 2)
@@ -189,20 +201,46 @@ class PipelineTests(unittest.TestCase):
         features.run(self.config)
         with threadpool_limits(limits=1):
             metrics = train_ml.run(self.config)
-        self.assertEqual(set(metrics.model), {"SVM", "RandomForest", "LDA"})
+        self.assertEqual(set(metrics.model), {"SVM", "RandomForest", "LDA", "LogisticRegression"})
         self.assertTrue(np.isfinite(metrics.select_dtypes(include="number")).all().all())
         for split in read_json(output / "cv_splits.json"):
             self.assertFalse(set(split["train_subjects"]) & set(split["test_subjects"]))
         oof = pd.read_csv(output / "oof_predictions.csv")
-        self.assertEqual(len(oof), len(y) * 3)
+        self.assertEqual(len(oof), len(y) * 4)
         self.assertFalse(oof.duplicated(["model", "trial_index"]).any())
-        for name in ("svm", "randomforest", "lda"):
+        for name in ("svm", "randomforest", "lda", "logisticregression"):
             matrix = pd.read_csv(output / f"confusion_matrix_{name}.csv", index_col=0)
             self.assertEqual(matrix.to_numpy().sum(), len(y))
             with (output / "models" / f"{name}_final.pkl").open("rb") as handle:
                 bundle = pickle.load(handle)
             self.assertEqual(bundle["pipeline"].predict(np.load(output / "features.npy")[:2]).shape, (2,))
             self.assertTrue((output / f"confusion_matrix_{name}.png").exists())
+            with (output / "models" / f"{name}_fold1.pkl").open("rb") as handle:
+                fold_model = pickle.load(handle)["pipeline"]
+            test_subjects = read_json(output / "cv_splits.json")[0]["test_subjects"]
+            training = ~np.isin(groups, test_subjects)
+            np.testing.assert_allclose(fold_model[0].mean_, np.load(output / "features.npy")[training].mean(axis=0, dtype=np.float64))
+        lda = train_ml.build_models(self.config)["LDA"][-1]
+        self.assertEqual(lda.priors, [0.5, 0.5])
+        for row in pd.read_csv(output / "metrics_per_fold.csv").itertuples():
+            held_out = oof[oof.model.eq(row.model) & oof.fold.eq(row.fold)]
+            self.assertAlmostEqual(row.precision, precision_score(held_out.y_true, held_out.y_pred, zero_division=0))
+            self.assertAlmostEqual(row.recall, recall_score(held_out.y_true, held_out.y_pred, zero_division=0))
+            self.assertAlmostEqual(row.roc_auc, roc_auc_score(held_out.y_true, held_out.score))
+            self.assertAlmostEqual(row.average_precision, average_precision_score(held_out.y_true, held_out.score))
+        report = read_json(output / "ml_benchmark_results.json")
+        self.assertEqual(len(report["results"]), 4)
+        for metric in ("accuracy", "balanced_accuracy", "precision", "recall", "f1", "roc_auc"):
+            self.assertIn(f"{metric}_mean", report["results"][0])
+            self.assertIn(f"{metric}_std", report["results"][0])
+        for filename in read_json(output / "training_metadata.json")["required_deliverables"]:
+            self.assertTrue((output / filename).exists(), filename)
+            if filename.endswith(".png"):
+                with Image.open(output / filename) as picture:
+                    self.assertAlmostEqual(picture.info["dpi"][0], 300, delta=1)
+        importance = pd.read_csv(output / "feature_importance.csv")
+        self.assertAlmostEqual(importance.importance_mean.sum(), 1)
+        self.assertEqual(len(importance), 6 * 26 + 5)
         visualize.plot_erp(output, output / "grand_average_erp.png")
         visualize.plot_distributions(output, self.config["visualization"])
         self.assertTrue((output / "feature_distributions.png").exists())
@@ -210,6 +248,57 @@ class PipelineTests(unittest.TestCase):
         preprocess.consolidate(subjects, output, metadata["preprocessing_signature"], metadata["revision"], self.config)
         with self.assertRaisesRegex(ValueError, "stale"):
             features.load_features(output)
+        # A full Drive must not leave a large partially allocated cohort behind.
+        original_open_memmap = np.lib.format.open_memmap
+        allocation_calls = []
+        def fail_second_allocation(*args, **kwargs):
+            allocation_calls.append(args[0])
+            if len(allocation_calls) == 2:
+                raise OSError("Simulated full artifact disk")
+            return original_open_memmap(*args, **kwargs)
+        with patch.object(np.lib.format, "open_memmap", side_effect=fail_second_allocation):
+            with self.assertRaisesRegex(OSError, "full artifact disk"):
+                preprocess.consolidate(subjects, output, metadata["preprocessing_signature"], metadata["revision"], self.config)
+        self.assertEqual(list(output.glob(".*.tmp.npy")), [])
+        self.assertFalse((output / "metadata.json").exists())
+
+    def test_p300_signed_area_latency_and_midline_roi(self):
+        times = np.arange(-50, 251) / 250
+        x = np.ones((2, 3, len(times))) * 4e-6
+        x[1] *= -1
+        values, names = features.extract_batch(x, 250, times, ["Fz", "Cz", "Pz"], self.config["features"])
+        for channel in ["Fz", "Cz", "Pz", "Midline_Fz_Cz_Pz"]:
+            np.testing.assert_allclose(values[:, names.index(f"{channel}__p300_auc_uv_s")], [1.2, -1.2], rtol=1e-6)
+            np.testing.assert_allclose(values[:, names.index(f"{channel}__p300_peak_latency_ms")], 300)
+        self.assertEqual(values.shape, (2, 3 * 26 + 5))
+
+    def test_ci_uses_subjects_and_student_t_not_trials(self):
+        evokeds = np.array([[1, 2], [2, 3], [4, 5]], dtype=float)
+        mean, lower, upper = visualize.subject_confidence_interval(evokeds)
+        expected = student_t.ppf(0.975, 2) * evokeds.std(axis=0, ddof=1) / np.sqrt(3)
+        np.testing.assert_allclose(upper - mean, expected)
+        np.testing.assert_allclose(mean - lower, expected)
+        _, lower, upper = visualize.subject_confidence_interval(evokeds[:1])
+        self.assertTrue(np.isnan(lower).all() and np.isnan(upper).all())
+
+    def test_class_weights_and_rbf_svm_are_explicit(self):
+        models = train_ml.build_models(self.config)
+        self.assertEqual(models["SVM"][-1].kernel, "rbf")
+        for model in ("SVM", "RandomForest", "LogisticRegression"):
+            self.assertEqual(models[model][-1].class_weight, "balanced")
+        self.assertEqual(models["LDA"][-1].solver, "lsqr")
+        self.assertEqual(models["LDA"][-1].shrinkage, "auto")
+
+    def test_rare_target_metrics_do_not_reward_majority_prediction(self):
+        y = np.array([0] * 8 + [1] * 2)
+        scores = np.zeros(10)
+        result = train_ml.classification_metrics(y, np.zeros(10), scores)
+        self.assertEqual(result["accuracy"], 0.8)
+        self.assertEqual(result["balanced_accuracy"], 0.5)
+        for metric in ("precision", "recall", "f1"):
+            self.assertEqual(result[metric], 0)
+        self.assertEqual(result["roc_auc"], 0.5)
+        self.assertAlmostEqual(result["average_precision"], 0.2)
 
     def test_insufficient_subjects_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "one-subject dry-run"):
