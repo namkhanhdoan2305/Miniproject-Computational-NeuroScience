@@ -2,7 +2,7 @@
 
 Codebase xử lý tín hiệu EEG, trích xuất đặc trưng thủ công và so sánh **Shrinkage LDA, SVM RBF, Random Forest, Logistic Regression L2**. Dữ liệu [duylplsn/oddball](https://huggingface.co/datasets/duylplsn/oddball) gồm 42 người, BrainVision + BIDS. Bài toán nhị phân: **standard/frequent → 0, target → 1; loại distractor**. Không có Deep Learning.
 
-[Mở notebook từng bước trên Colab](https://colab.research.google.com/github/namkhanhdoan2305/Miniproject-Computational-NeuroScience/blob/main/notebooks/colab_workflow.ipynb). Notebook chỉ chạy module, hiển thị hình và giải thích lựa chọn; logic nằm trong repo. Có thể chọn CPU hoặc NVIDIA GPU. Mỗi thuật toán chạy ở **một cell riêng**, xem kết quả ngay sau cell đó, cuối cùng mới tổng hợp so sánh.
+[Mở notebook thực nghiệm trên Colab](https://colab.research.google.com/github/namkhanhdoan2305/Miniproject-Computational-NeuroScience/blob/main/notebooks/colab_workflow.ipynb). Notebook trình bày bằng tiếng Việt theo cấu trúc kỹ thuật: mục tiêu và dữ liệu, phương pháp tiền xử lý, đặc trưng, thiết kế đánh giá, kết quả từng mô hình và thảo luận. Có công thức, tham chiếu tài liệu, bảng cấu hình thực tế và chú thích hình. Mỗi thuật toán chạy ở **một cell riêng**; bảng và nhận xét định lượng được tạo từ kết quả của lần chạy. Logic xử lý và huấn luyện nằm trong repo; hướng dẫn thao tác được giữ trong README này.
 
 ## Chạy trên Google Colab
 
