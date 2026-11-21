@@ -58,3 +58,13 @@ python -m src.visualize
 ```
 
 For an old checkout whose preprocessing signature differs, use a fresh artifacts folder or rerun preprocessing with `--overwrite`. For local execution, add `--raw-dir ./temp_raw`. See README for Drive linking before running on Colab.
+
+## 2026-11-21 — Modular Colab workflow and preprocessing QC
+
+- Preserved preprocessing/feature schema and the four baseline hyperparameters; no claimed score improvement from this refactor.
+- Moved each model definition into `src/models/`, added independent training entrypoints and common CV/evaluation engine. Per-model results and integrity manifests precede aggregation; comparison refuses missing, edited or incompatible runs.
+- Added actual raw/filtered/post-ICA capture before raw cleanup, matched-retained-trial ERP, bounded trace/PSD, ICA correlations/components/sources, channel inspection flags, final trial heatmap and descriptive P300 scalp maps. QC-only redownloads selected subjects without replacing existing cohort/features. Missing montage positions are tolerated for clean recordings but still require correction when interpolation is necessary.
+- Added subject-level diagnostic learning curves inside the first outer TRAIN fold. RF log loss uses growing forests on a fixed inner split (no trial-level OOB evaluation). Logistic optimizer trace is a separate CPU diagnostic with a verified balanced L2 objective; it is not represented as the history of GPU or outer-CV fits.
+- Added optional direct cuML weighted RBF SVM / L2 Logistic Regression, lazy availability checks, recorded CPU fallback, explicit GPU failure mode. LDA shrinkage/priors and weighted RF remain CPU. GPU hardware performance has not been tested locally.
+- Added clean Vietnamese Colab notebook with separate cells per model, checked subprocess execution, environment provenance, saved-image display and final comparison. Existing 42-subject Drive arrays can be reused.
+- Validation: regression tests include independent-run/compare/resume, stale-file/protocol rejection, outer/inner subject isolation, GPU adapter contracts/fallback, convergence retry, raw QC-only preservation, and ICA QC. Full-cohort scientific performance must be measured separately on Colab; no promise of automatic F1 gains.

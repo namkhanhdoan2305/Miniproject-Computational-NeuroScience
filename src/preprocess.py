@@ -14,6 +14,11 @@ import tempfile
 import uuid
 import warnings
 
+if __package__ in (None, ""):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "src"
+
 # Avoid a persistent Xet chunk cache outside the disposable download directory.
 # Must be set before importing huggingface_hub, including its constants.
 os.environ["HF_HUB_DISABLE_XET"] = "1"
@@ -108,14 +113,19 @@ def prepare_channels(raw, header, config):
     auxiliaries = [name for name, kind in zip(raw.ch_names, raw.get_channel_types())
                    if kind in {"eog", "ecg"} and name not in requested]
     raw.pick(list(requested) + auxiliaries).load_data()
-    # Positions are needed only when interpolating explicitly marked bad channels.
+    # Also retain approximate positions for QC maps. Missing positions alone must
+    # not fail a clean recording, but interpolation still requires valid geometry.
+    montage = "colin27_1005" if "colin27_1005" in mne.channels.get_builtin_montages() else "standard_1005"
+    raw.set_montage(montage, match_case=False, on_missing="warn", verbose=False)
     if raw.info["bads"]:
-        raw.set_montage("standard_1005", match_case=False, on_missing="raise", verbose=False)
+        positions = np.asarray([raw.info["chs"][i]["loc"][:3] for i in mne.pick_types(raw.info, eeg=True, exclude=[])])
+        if not np.isfinite(positions).all():
+            raise ValueError("Cannot interpolate marked bad EEG channels without valid positions; supply a matching montage.")
         raw.interpolate_bads(reset_bads=True, verbose=False)
     return list(requested)
 
 
-def clean_with_ica(raw, config):
+def clean_with_ica(raw, config, qc=None):
     settings = config["preprocessing"]["ica"]
     if not settings["enabled"]:
         return {"enabled": False, "excluded": []}
@@ -167,21 +177,28 @@ def clean_with_ica(raw, config):
         LOGGER.warning("ICA found no EOG components; inspect the saved correlation scores.")
     if len(ica.exclude) >= ica.n_components_:
         raise ValueError("ICA marked every component; inspect data and EOG configuration.")
-    ica.apply(raw, verbose=False)
     report = {"enabled": True, "n_components": int(ica.n_components_),
               "excluded": ica.exclude, "eog_sources": sources, "using_eeg_proxy": using_proxy,
               "eog_scores": scores, "convergence_warnings": convergence,
               "fit_seconds": float(fit_raw.times[-1])}
+    if qc is not None:
+        qc.capture_ica(ica, fit_raw, report)
+    ica.apply(raw, verbose=False)
     del fit_raw, ica
     return report
 
 
-def process_recording(header, config):
+def process_recording(header, config, qc_dir=None):
     p = config["preprocessing"]
     events_path = header.with_name(header.name.replace("_eeg.vhdr", "_events.tsv"))
     if not events_path.exists():
         raise FileNotFoundError(f"Missing BIDS event table: {events_path}")
     raw = mne.io.read_raw_brainvision(header, preload=False, verbose=False)
+    qc = None
+    if qc_dir is not None:
+        # Late import keeps the downloader usable without a plotting session.
+        from src.qc import RecordingQC
+        qc = RecordingQC(qc_dir, config)
     try:
         channels = prepare_channels(raw, header, config)
         events, counts = read_events(events_path, raw, config)
@@ -195,6 +212,8 @@ def process_recording(header, config):
             descriptions.append(description)
         raw.set_annotations(mne.Annotations(raw.annotations.onset, raw.annotations.duration,
                                            descriptions, orig_time=raw.annotations.orig_time))
+        if qc is not None:
+            qc.capture("raw", raw, events)
         skip = ("edge", "bad_acq_skip", "bad boundary")
         if p["notch_freq"] >= raw.info["sfreq"] / 2:
             raise ValueError("Notch frequency must be below the recording Nyquist frequency.")
@@ -206,7 +225,11 @@ def process_recording(header, config):
         raw, events = raw.resample(p["sfreq"], events=events, n_jobs=p["n_jobs"], verbose=False)
         if len(np.unique(events[:, 0])) != len(events):
             raise ValueError("Retained events collide after resampling.")
-        ica_report = clean_with_ica(raw, config)
+        if qc is not None:
+            qc.capture("filtered", raw, events)
+        ica_report = clean_with_ica(raw, config, qc=qc)
+        if qc is not None:
+            qc.capture("post_ica", raw, events)
         if p["reference"] == "average":
             raw.set_eeg_reference("average", projection=False, verbose=False)
         elif p["reference"] is not None:
@@ -228,6 +251,8 @@ def process_recording(header, config):
                   "drop_reasons": {reason: sum(reason in reasons for reasons in epochs.drop_log)
                                    for reason in sorted({r for reasons in epochs.drop_log for r in reasons})},
                   "ica": ica_report}
+        if qc is not None:
+            qc.finish(epochs, report)
         return x, y, epochs.ch_names, epochs.times.copy(), report
     finally:
         raw.close()
@@ -265,13 +290,17 @@ def process_subject(subject, local, destination, signature, config):
         raise FileNotFoundError(f"No oddball BrainVision header for {subject}")
     xs, ys, reports, channels, times = [], [], [], None, None
     for header in headers:
-        x, y, run_channels, run_times, report = process_recording(header, config)
+        settings = config["qc"]
+        qc_dir = artifact_dir(config) / "qc" / subject / header.stem if settings["enabled"] and subject in settings["detail_subjects"] else None
+        x, y, run_channels, run_times, report = process_recording(header, config, qc_dir)
         if channels is not None and (run_channels != channels or not np.array_equal(times, run_times)):
             raise ValueError(f"Inconsistent run schema for {subject}")
         channels, times = run_channels, run_times
         xs.append(x)
         ys.append(y)
         reports.append(report)
+    if config["qc"]["enabled"] and subject in config["qc"]["detail_subjects"]:
+        write_json(artifact_dir(config) / "qc" / subject / "source.json", {"preprocessing_signature": signature})
     destination.mkdir(parents=True, exist_ok=True)
     # metadata.json is a completion marker; it is written last.
     (destination / "metadata.json").unlink(missing_ok=True)
@@ -342,7 +371,7 @@ def consolidate(subjects, output, signature, revision, config, dry_run=False):
     LOGGER.info("Consolidated %d subjects, %d epochs into %s", len(subjects), total, output)
 
 
-def run(config, dry_run=False, resume=False, overwrite=False):
+def run(config, dry_run=False, resume=False, overwrite=False, qc_only=False, subjects=None):
     output = artifact_dir(config)
     api = HfApi()
     info = api.dataset_info(config["dataset"]["repo_id"], revision=config["dataset"]["revision"])
@@ -351,12 +380,12 @@ def run(config, dry_run=False, resume=False, overwrite=False):
     discovered = sorted({part for f in files for part in PurePosixPath(f).parts if re.fullmatch(r"sub-\d+", part)})
     if len(discovered) != config["dataset"]["expected_subjects"]:
         LOGGER.warning("Found %d subjects; configured expectation is %d", len(discovered), config["dataset"]["expected_subjects"])
-    subjects = ["sub-01"] if dry_run else (config["dataset"]["subjects"] or discovered)
+    subjects = ["sub-01"] if dry_run else (subjects or config["dataset"]["subjects"] or (["sub-01"] if qc_only else discovered))
     if not subjects or len(set(subjects)) != len(subjects) or not set(subjects).issubset(discovered):
         raise ValueError(f"Subjects must be unique and present in the repo. Available: {discovered}")
     signature = fingerprint({"pipeline_version": PREPROCESSING_VERSION, "revision": revision, "repo": config["dataset"]["repo_id"],
                              "events": config["events"], "preprocessing": config["preprocessing"], "seed": config["seed"]})
-    if (output / "metadata.json").exists():
+    if not qc_only and (output / "metadata.json").exists():
         previous = read_json(output / "metadata.json")
         if dry_run and not previous["dry_run"]:
             raise ValueError("Dry-run cannot replace a cohort. Use a separate --artifacts directory.")
@@ -365,7 +394,7 @@ def run(config, dry_run=False, resume=False, overwrite=False):
     for subject in subjects:
         destination = output / "subjects" / subject
         marker = destination / "metadata.json"
-        if marker.exists() and not overwrite:
+        if not qc_only and marker.exists() and not overwrite:
             cached = read_json(marker)
             if not resume:
                 raise FileExistsError(f"{subject} checkpoint exists. Use --resume or --overwrite.")
@@ -381,7 +410,19 @@ def run(config, dry_run=False, resume=False, overwrite=False):
         if not any(f.endswith(".vhdr") for f in selected):
             raise FileNotFoundError(f"No raw files for {subject}")
         with downloaded_subject(subject, selected, revision, config) as local:
-            process_subject(subject, local, destination, signature, config)
+            if qc_only:
+                # Re-download only explicitly requested subjects for missing QC;
+                # never touch cohort arrays, checkpoints, or feature signatures.
+                headers = sorted(local.glob(f"**/{subject}/**/*_task-oddball*_eeg.vhdr"))
+                if not headers:
+                    raise FileNotFoundError(f"No oddball BrainVision header for {subject}")
+                for header in headers:
+                    process_recording(header, config, output / "qc" / subject / header.stem)
+                write_json(output / "qc" / subject / "source.json", {"revision": revision, "preprocessing_signature": signature})
+            else:
+                process_subject(subject, local, destination, signature, config)
+    if qc_only:
+        return
     consolidate(subjects, output, signature, revision, config, dry_run)
     if dry_run:
         try:
@@ -394,9 +435,13 @@ def run(config, dry_run=False, resume=False, overwrite=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--dry-run", action="store_true", help="Process the complete sub-01 recording and plot its Fz/Pz ERPs.")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--dry-run", action="store_true", help="Process the complete sub-01 recording and plot its Fz/Pz ERPs.")
+    scope.add_argument("--qc-only", action="store_true", help="Download selected subjects only for raw/stage QC; preserve existing cohort arrays.")
+    parser.add_argument("--subjects", nargs="+", help="Explicit subjects, e.g. sub-01 sub-02; QC-only defaults to sub-01.")
     parser.add_argument("--artifacts", type=Path, help="Override the persistent artifact directory.")
     parser.add_argument("--raw-dir", type=Path, help="Override /content/temp_raw for local execution.")
+    parser.add_argument("--revision", help="Override HF revision, e.g. saved cohort SHA when regenerating QC.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--resume", action="store_true", help="Reuse compatible completed subject checkpoints.")
     mode.add_argument("--overwrite", action="store_true", help="Reprocess the requested subjects.")
@@ -407,8 +452,10 @@ def main():
         config["paths"]["artifacts"] = str(args.artifacts)
     if args.raw_dir:
         config["paths"]["raw"] = str(args.raw_dir)
+    if args.revision:
+        config["dataset"]["revision"] = args.revision
     with threadpool_limits(limits=1):
-        run(config, args.dry_run, args.resume, args.overwrite)
+        run(config, args.dry_run, args.resume, args.overwrite, args.qc_only, args.subjects)
 
 
 if __name__ == "__main__":

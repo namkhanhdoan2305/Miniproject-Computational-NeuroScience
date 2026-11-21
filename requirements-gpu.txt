@@ -1,0 +1,5 @@
+# Optional: Linux x86_64, NVIDIA GPU, compatible CUDA 12 driver/runtime.
+# Install the CPU requirements first. Never needed for CPU runs or preprocessing.
+--extra-index-url https://pypi.nvidia.com
+cuml-cu12>=25.12,<27; sys_platform == "linux" and platform_machine == "x86_64"
+cupy-cuda12x>=13,<15; sys_platform == "linux" and platform_machine == "x86_64"

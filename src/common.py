@@ -43,6 +43,27 @@ def load_config(path=DEFAULT_CONFIG):
     ica = p["ica"]
     if ica["enabled"] and not p["l_freq"] <= ica["fit_highpass"] < p["h_freq"]:
         raise ValueError("ICA fit high-pass must lie within the preprocessing passband.")
+    training = config["training"]
+    # Keep older user configs runnable without changing the EEG/feature schema.
+    training.setdefault("device", "auto")
+    training.setdefault("max_iter", 2000)
+    diagnostics = training.setdefault("diagnostics", {})
+    diagnostics.setdefault("enabled", True)
+    diagnostics.setdefault("fractions", [0.33, 0.66, 1.0])
+    diagnostics.setdefault("logistic_max_iter", 300)
+    if training["device"] not in {"cpu", "gpu", "auto"}:
+        raise ValueError("training.device must be auto, cpu or gpu")
+    if not diagnostics["fractions"] or not all(0 < f <= 1 for f in diagnostics["fractions"]):
+        raise ValueError("Diagnostic fractions must lie in (0, 1].")
+    if training["rf_estimators"] < 1 or training["max_iter"] < 1 or diagnostics["logistic_max_iter"] < 1:
+        raise ValueError("Tree/iteration limits must be positive.")
+    qc = config.setdefault("qc", {})
+    for key, value in {"enabled": True, "detail_subjects": ["sub-01"], "trace_seconds": 10., "psd_seconds": 60.}.items():
+        qc.setdefault(key, value)
+    if not isinstance(qc["detail_subjects"], list):
+        raise ValueError("qc.detail_subjects must be a list of subject IDs")
+    if min(config["qc"]["trace_seconds"], config["qc"]["psd_seconds"]) <= 0:
+        raise ValueError("QC trace/PSD durations must be positive.")
     return config
 
 
@@ -69,7 +90,7 @@ def read_json(path):
 
 
 def package_versions():
-    packages = ["numpy", "scipy", "mne", "scikit-learn", "PyWavelets", "huggingface_hub"]
+    packages = ["numpy", "scipy", "mne", "scikit-learn", "PyWavelets", "huggingface_hub", "cuml-cu12", "cupy-cuda12x"]
     result = {}
     for package in packages:
         try:

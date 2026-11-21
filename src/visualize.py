@@ -6,6 +6,11 @@ import argparse
 from pathlib import Path
 import shutil
 
+if __package__ in (None, ""):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "src"
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -264,20 +269,27 @@ def export_all_figures(directory, config, provenance=None):
     plot_importance(directory)
     plot_metrics_table(directory, summary)
     plot_distributions(directory, config["visualization"])
+    from src.data_overview import export_data_overview
+    export_data_overview(directory, config["features"]["p300_window"])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--artifacts", type=Path)
-    parser.add_argument("--erp-only", action="store_true", help="Plot the three-channel ERP without requiring feature/training artifacts.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--erp-only", action="store_true", help="Plot the three-channel ERP without requiring feature/training artifacts.")
+    mode.add_argument("--data-only", action="store_true", help="Plot cohort/class distribution, processed trials, ERP and preprocessing summary before ML.")
     args = parser.parse_args()
     setup_logging()
     config = load_config(args.config)
     if args.artifacts:
         config["paths"]["artifacts"] = str(args.artifacts)
     output = artifact_dir(config)
-    if args.erp_only:
+    if args.erp_only or args.data_only:
+        if args.data_only:
+            from src.data_overview import export_data_overview
+            export_data_overview(output, config["features"]["p300_window"])
         plot_erp(output, output / "fig1_grand_average_erp.png", config["visualization"]["channels"], config["features"]["p300_window"])
         shutil.copyfile(output / "fig1_grand_average_erp.png", output / "grand_average_erp.png")
         shutil.copyfile(output / "fig1_grand_average_erp.csv", output / "grand_average_erp.csv")
